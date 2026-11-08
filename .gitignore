@@ -8,3 +8,4 @@ private-data/
 *.sqlite-wal
 *private*backup*.json
 .openai/
+dist/

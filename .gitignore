@@ -1,0 +1,10 @@
+node_modules/
+private-data/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*private*backup*.json
+.openai/

@@ -1,0 +1,1 @@
+{"name":"donggang-capstone-collaboration","private":true,"type":"module","engines":{"node":">=24.0.0"},"scripts":{"start":"node server/start.mjs","test":"node --test tests/*.test.mjs"}}

@@ -1,0 +1,54 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createApp} from '../server/app.mjs';
+import {LocalStore,STORE_KEY,SESSION_KEY} from '../collaboration/modules/local-store.mjs';
+import {snapshotLegacy,prepareMigration} from '../collaboration/modules/legacy-migration.mjs';
+import {fields,safeImage} from '../collaboration/modules/shared.mjs';
+import {reportHTML} from '../collaboration/modules/report.mjs';
+const image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jX1cAAAAASUVORK5CYII=';
+const origin='https://capstone.example.invalid',admin={email:'teacher@example.invalid',password:'Teacher-long-test-41!'};
+const newRecord={week:15,title:'설계 기록',description:'대지 면적 200㎡, 구조와 채광 분석',imageUrl:image};
+function memory(){const m=new Map();return {getItem:k=>m.get(k)??null,setItem:(k,v)=>m.set(k,String(v)),removeItem:k=>m.delete(k),entries:()=>[...m]};}
+async function request(app,path,method='GET',data,cookie,requestOrigin=origin){const response=await app.handle(new Request(origin+'/api'+path,{method,headers:{origin:requestOrigin,...(data?{'content-type':'application/json'}:{}),...(cookie?{cookie}:{})},...(data?{body:JSON.stringify(data)}:{})}),{ip:'127.0.0.1'});return {status:response.status,data:await response.json(),cookie:response.headers.get('set-cookie')};}
+async function login(app,credentials){const r=await request(app,'/auth/login','POST',credentials);assert.equal(r.status,200);return r.cookie;}
+async function signup(app,name,teacher){const v={email:name+'@example.invalid',password:'Student-long-test-42!',name};assert.equal((await request(app,'/auth/signup','POST',{...v,role:'instructor'})).status,201);let c=await login(app,v);const u=(await request(app,'/auth/me','GET',null,c)).data;assert.equal(u.role,'student');assert.equal(u.status,'pending');assert.equal((await request(app,'/records','GET',null,c)).status,403);assert.equal((await request(app,'/members/'+u.id+'/approve','POST',{},teacher)).status,200);return {cookie:c,user:u,credentials:v};}
+test('server authorization, image retention, versions, trash, restoration, import, sessions, durable DB',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'capstone-test-'));const databasePath=join(dir,'test.sqlite');let app;
+ try{
+ app=await createApp({origin,databasePath,adminEmail:admin.email,adminPassword:admin.password});const teacher=await login(app,admin);assert.match(teacher,/HttpOnly/);assert.match(teacher,/SameSite=Strict/);assert.match(teacher,/Secure/);
+ const a=await signup(app,'alpha',teacher),b=await signup(app,'bravo',teacher);
+ assert.equal((await request(app,'/members/'+a.user.id+'/approve','POST',{},a.cookie)).status,403);
+ assert.equal((await request(app,'/records?all=true','GET',null,a.cookie)).status,403);
+ assert.equal((await request(app,'/records','POST',newRecord,a.cookie,'https://evil.invalid')).status,403);
+ let r=await request(app,'/records','POST',{...newRecord,studentId:b.user.studentId},a.cookie);assert.equal(r.status,201);assert.equal(r.data.studentId,a.user.studentId);let record=r.data;
+ assert.equal((await request(app,'/records/'+record.id+'/history','GET',null,b.cookie)).status,404);
+ assert.equal((await request(app,'/records/'+record.id,'PATCH',{...newRecord,expectedVersion:1},b.cookie)).status,404);
+ r=await request(app,'/records/'+record.id,'PATCH',{...newRecord,title:'수정',expectedVersion:1},a.cookie);assert.equal(r.status,200);record=r.data;assert.equal(record.imageUrl,image);assert.equal(record.version,2);assert.equal(record.reviewStatus,'stale');
+ assert.equal((await request(app,'/records/'+record.id,'PATCH',{...newRecord,expectedVersion:1},a.cookie)).status,409);
+ assert.equal((await request(app,'/records/'+record.id,'DELETE',{expectedVersion:2},a.cookie)).status,200);
+ assert.equal((await request(app,'/records','GET',null,a.cookie)).data.length,0);
+ const deleted=(await request(app,'/records?trash=true','GET',null,a.cookie)).data[0];assert.equal(deleted.imageUrl,image);
+ assert.equal((await request(app,'/records/'+record.id+'/restore','POST',{expectedVersion:3},a.cookie)).status,200);
+ assert.equal((await request(app,'/records/'+record.id+'/history','GET',null,a.cookie)).data.length,3);
+ assert.equal((await request(app,'/records?all=true','GET',null,teacher)).data.length,1);
+ assert.equal((await request(app,'/records/'+record.id+'/review','POST',{},a.cookie)).status,503);
+ const backup=(await request(app,'/backup','GET',null,a.cookie)).data;assert.equal(backup.workspace.records[0].history.length,3);assert.equal('password_hash' in backup.workspace.members[0],false);
+ assert.equal((await request(app,'/import','POST',{backup},b.cookie)).status,403);
+ assert.equal((await request(app,'/import','POST',{backup},a.cookie)).data.count,1);
+ assert.equal((await request(app,'/import','POST',{backup},a.cookie)).data.count,0);
+ const broken=structuredClone(backup);broken.workspace.records[0].id='different';broken.workspace.records.push({...newRecord,id:'bad',version:1,studentId:a.user.studentId,week:0});assert.equal((await request(app,'/import','POST',{backup:broken},a.cookie)).status,400);assert.equal((await request(app,'/records','GET',null,a.cookie)).data.length,2);
+ app.close();app=await createApp({origin,databasePath});const again=await login(app,a.credentials);assert.equal((await request(app,'/records','GET',null,again)).data.length,2);
+ await request(app,'/auth/logout','POST',{},again);assert.equal((await request(app,'/auth/me','GET',null,again)).status,401);
+ }finally{app?.close();await rm(dir,{recursive:true,force:true});}
+});
+test('server sessions expire and authentication attempts are rate limited',async()=>{let clock=Date.now();const app=await createApp({origin,adminEmail:admin.email,adminPassword:admin.password,now:()=>clock});try{const cookie=await login(app,admin);clock+=43200001;assert.equal((await request(app,'/auth/me','GET',null,cookie)).status,401);for(let i=0;i<20;i++)await request(app,'/auth/login','POST',{...admin,password:'wrong'});assert.equal((await request(app,'/auth/login','POST',admin)).status,429);}finally{app.close();}});
+test('local save, ownership, history, soft delete, quota failure and corrupt data are preserved',async()=>{const storage=memory(),session=memory(),a=new LocalStore(storage,session);const u=await a.signup({name:'로컬',email:'local@example.invalid',password:'long-local-pass-23'});let r=await a.save(newRecord);assert.equal(r.version,1);r=await a.save({...r,expectedVersion:1,title:'변경'});assert.equal((await a.history(r.id))[0].imageUrl,image);await a.trash(r.id,2);assert.equal((await a.records()).length,0);await a.trash(r.id,3,true);assert.equal((await a.records())[0].version,4);const before=storage.getItem(STORE_KEY),write=storage.setItem;storage.setItem=()=>{throw Error('quota')};await assert.rejects(()=>a.save(newRecord),/quota/);assert.equal(storage.getItem(STORE_KEY),before);storage.setItem=write;
+ await a.signup({name:'다른 학생',email:'other@example.invalid',password:'long-local-pass-24'});await assert.rejects(()=>a.save({...r,expectedVersion:4}),/본인/);assert.equal((await a.records()).length,0);
+ storage.setItem(STORE_KEY,'{broken');await assert.rejects(()=>a.save(newRecord));assert.equal(storage.getItem(STORE_KEY),'{broken');assert.ok(u.studentId.startsWith('local_'));});
+test('legacy login and deterministic imports preserve original keys, missing IDs and tombstones',async()=>{const storage=memory(),session=memory();const password='old-secret';const passwordHash=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(password))).toString('hex');storage.setItem('dku_capstone_students_v1',JSON.stringify([{name:'이전',email:'old@example.invalid',studentId:'s3',passwordHash}]));storage.setItem('dku_local_uploads_v1',JSON.stringify([{...newRecord,studentId:'s3'},{...newRecord,studentId:'s3',title:'두 번째'},{...newRecord,studentId:'s4',title:'다른 학생'}]));const before=snapshotLegacy(storage);const a=new LocalStore(storage,session);await a.login({email:'old@example.invalid',password});assert.equal((await a.importLegacy()).count,2);assert.equal((await a.importLegacy()).count,0);storage.setItem('dku_current_student',JSON.stringify({studentId:'s3'}));assert.equal((await a.importLegacy()).count,0);const records=await a.records();assert.equal(records.length,2);assert.equal(new Set(records.map(r=>r.id)).size,2);const after=snapshotLegacy(storage).raw;delete after.dku_current_student;const earlier={...before.raw};delete earlier.dku_current_student;assert.deepEqual(after,earlier);const p=await prepareMigration(before);assert.equal(p.counts.source,p.counts.prepared);assert.equal('passwordHash' in p.memberMappingCandidates[0],false);storage.setItem('dku_deleted_uploads_v1','[null]');await assert.rejects(()=>a.importLegacy(),/모호/);assert.equal((await a.records()).length,2);});
+test('backup import retains images, prior history and deleted state without importing roles',async()=>{const a=new LocalStore(memory(),memory());const user=await a.signup({name:'A',email:'a@example.invalid',password:'long-local-pass-33'});const backup={kind:'capstone-workspace-backup',workspace:{schemaVersion:2,members:[{email:user.email,studentId:'old',role:'instructor'}],records:[{...newRecord,id:'x',studentId:'old',version:4,deletedAt:123,history:[{...newRecord,version:1}],legacyHistory:[{...newRecord,version:0}]}]}};assert.equal((await a.importBackup(backup)).count,1);assert.equal((await a.importBackup(backup)).count,0);assert.equal((await a.me()).role,'student');assert.equal((await a.records({trash:true}))[0].legacyHistory.length,2);assert.equal((await a.records({trash:true}))[0].imageUrl,image);});
+test('report escapes user content, includes safe images, explains unconnected review and prints on explicit click',()=>{const html=reportHTML({name:'<script>test</script>'},[{...newRecord,id:'test',aiComment:'<img onerror=x>',reviewStatus:'not-configured'}],'브라우저 데모');assert.ok(!html.includes('<script>test'));assert.match(html,/&lt;img onerror=x&gt;/);assert.ok(html.includes(image));assert.match(html,/키워드 사전 점검/);assert.match(html,/print-report/);assert.equal(safeImage('javascript:alert(1)'), '');assert.throws(()=>fields({...newRecord,imageUrl:'data:image/png;base64,VGVzdA=='}),/형식/);assert.throws(()=>fields({...newRecord,week:0}));});
+test('public demo uses isolated memory and resets without accessing real storage',async()=>{const {createDemoStore}=await import('../collaboration/modules/demo-store.mjs');const a=createDemoStore();assert.equal((await a.me()).email,'demo@example.invalid');assert.equal((await a.records()).length,2);await a.save(newRecord);assert.equal((await a.records()).length,3);const fresh=createDemoStore();assert.equal((await fresh.records()).length,2);assert.equal((await fresh.me()).role,'student');});

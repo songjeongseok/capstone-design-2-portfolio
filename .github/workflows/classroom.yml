@@ -31,3 +31,9 @@ jobs:
       - run: npm test
       - run: node scripts/publish.mjs
       - run: psql -X -v ON_ERROR_STOP=1 -f tests/classroom-postgres.sql
+      - name: Test the email and review screens with a simulated provider
+        env:
+          NODE_PATH: ${{ runner.temp }}/capstone-browser/node_modules
+        run: |
+          npm install --prefix "$RUNNER_TEMP/capstone-browser" --no-audit --no-fund playwright-core@1.55.0
+          CHROME_BIN="$(command -v google-chrome)" node tests/cloud-browser.cjs

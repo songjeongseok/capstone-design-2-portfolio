@@ -5,12 +5,13 @@ const {strict:assert}=require('node:assert');
  const browser=await chromium.launch({executablePath:process.env.CHROME_BIN || 'google-chrome',args:['--no-sandbox']});
  try {
  const page=await browser.newPage({viewport:{width:390,height:844}});
- const faults=[];page.on('pageerror',e=>faults.push(e.message));
+ const faults=[];page.on('pageerror',e=>{faults.push(e.message);console.error(e.message);});
+ page.on('requestfailed',req=>console.error(req.method(),new URL(req.url()).pathname,req.failure()?.errorText));
  let rows=[],user={id:'test',studentId:'test',email:'s@example.invalid',name:'시험학생',role:'student',status:'active'},mail=0,review=0;
  const origin='https://classroom.example.invalid';
  await page.route('**/*',async route=>{
   const req=route.request(),u=new URL(req.url());
-  const json=v=>route.fulfill({json:v,headers:{'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Headers':'*','Access-Control-Allow-Methods':'POST, GET, OPTIONS'}});
+  const json=v=>route.fulfill({json:v,headers:{'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Headers':'apikey, authorization, content-type','Access-Control-Allow-Methods':'POST, GET, OPTIONS'}});
   if(req.method()==='OPTIONS')return json({});
   if(u.host==='test.supabase.co'){
    const data=req.postDataJSON();
@@ -35,6 +36,8 @@ const {strict:assert}=require('node:assert');
  await page.getByLabel('이름',{exact:true}).fill('시험학생');
  await page.getByLabel('이메일',{exact:true}).fill(user.email);
  await page.getByRole('button',{name:'이메일로 인증번호 받기'}).click();
+ await page.getByText('인증번호 확인',{exact:true}).first().or(page.locator('#error:visible')).first().waitFor();
+ if(await page.locator('#error:visible').count())throw Error(await page.locator('#error').textContent());
  await page.getByLabel('이메일 인증번호',{exact:true}).fill('123456');
  await page.getByRole('button',{name:'인증번호 확인'}).click();
  await page.getByRole('button',{name:'설계자료 제출'}).click();

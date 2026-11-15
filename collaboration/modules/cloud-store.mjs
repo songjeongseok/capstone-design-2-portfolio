@@ -13,7 +13,7 @@ export class CloudStore {
     this.key = config.publicKey;
     this.sessionKey = 'capstone:otp:' + config.url;
     this.storage = storage;
-    this.fetch = request;
+    this.fetch = (...args) => request(...args);
   }
 
   async send(path, data, token) {
